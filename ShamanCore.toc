@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: ShamanCore
+## Notes: Shaman rotation, buff, and healing helper for Turtle WoW
+## Author: Michael
+## Version: 0.4.1
+## SavedVariables: ShamanCore_Config
+
+ShamanCore.lua
