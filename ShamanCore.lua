@@ -1,11 +1,12 @@
--- ShamanCore v0.4.1
+-- ShamanCore v0.4.15
 -- Press-driven shaman rotation, buff, and emergency-heal helper
 -- for Turtle WoW / Vanilla 1.12.
 
 local _, playerClass = UnitClass("player")
 if playerClass ~= "SHAMAN" then return end
 
-local VERSION = "0.4.1"
+local VERSION = "0.4.15"
+local PRIORITY_LOOKAHEAD = 0.8
 local ICON_PATH = "Interface\\Icons\\"
 local DEFAULT_ICON = "Spell_Nature_Lightning"
 local WAIT_ICON = "INV_Misc_PocketWatch_01"
@@ -47,6 +48,10 @@ local rotationMacroIcon
 local buffMacroIcon
 local updateElapsed = 0
 local lastMacroIcons = {}
+local recentlyCastRotationSpells = {}
+local lastRotationAttempt
+local lockedRotationPreview
+local lockedRotationPreviewUntil = 0
 
 local DEFAULTS = {
     Rotation1 = "Flame Shock",
@@ -334,29 +339,117 @@ local function GetNextMissingBuff(readyOnly)
     return nil
 end
 
-local function IsRotationSpellEligible(spellName, readyOnly)
-    if not spellName or spellName == "None" or not GetSpellIndex(spellName) then
-        return false
-    end
-    if spellName == "Flame Shock"
-        and UnitHasAuraTexture("target", spellName, true) then
-        return false
-    end
-    return not readyOnly or IsSpellReady(spellName)
+local function RotationSpellEffectIsActive(spellName)
+    return (spellName == "Earth Shock" or spellName == "Flame Shock"
+        or spellName == "Frost Shock")
+        and UnitHasAuraTexture("target", spellName, true)
 end
 
-local function GetNextRotationSpell(readyOnly)
+local function GetRotationSpellRemaining(spellName)
+    if not spellName or spellName == "None" or not GetSpellIndex(spellName) then
+        return nil
+    end
+    if RotationSpellEffectIsActive(spellName) then return nil end
+
+    local now = GetTime()
+    local manualRemaining = 0
+    local blockedUntil = recentlyCastRotationSpells[spellName]
+    if blockedUntil then
+        if spellName == "Earth Shock" or spellName == "Flame Shock"
+            or spellName == "Frost Shock" then
+            -- Once the GCD has passed, Turtle exposes the real shared Shock
+            -- cooldown. Replace our six-second fallback with that exact,
+            -- talent-adjusted expiry instead of letting the icon bounce back.
+            local index = GetSpellIndex(spellName)
+            if index then
+                local start, duration = GetSpellCooldown(
+                    index, BOOKTYPE_SPELL)
+                if start and duration and duration > 1.5 then
+                    blockedUntil = start + duration
+                    recentlyCastRotationSpells[spellName] = blockedUntil
+                end
+            end
+        end
+        if now < blockedUntil then
+            manualRemaining = blockedUntil - now
+        else
+            recentlyCastRotationSpells[spellName] = nil
+        end
+    end
+
+    local index = GetSpellIndex(spellName)
+    local start, duration, enabled = GetSpellCooldown(
+        index, BOOKTYPE_SPELL)
+    if enabled == 0 then return 999999 end
+
+    local cooldownRemaining = 0
+    -- Durations at or below 1.5 seconds are the shared GCD. Treat the spell
+    -- as the next usable action while still dimming its icon separately.
+    if start and duration and duration > 1.5 then
+        cooldownRemaining = math.max(0, start + duration - now)
+    end
+    return math.max(manualRemaining, cooldownRemaining)
+end
+
+local function GetNextRotationSpell(readyOnly, includeSoonest)
     local first
+    local soonest
+    local soonestRemaining = 999999
     local i
     for i = 1, 5 do
         local spellName = ShamanCore_Config["Rotation" .. i]
-        if spellName and spellName ~= "None" and GetSpellIndex(spellName) then
+        local remaining = GetRotationSpellRemaining(spellName)
+        if remaining ~= nil then
             if not first then first = spellName end
-            if IsRotationSpellEligible(spellName, readyOnly) then return spellName end
+            if readyOnly then
+                -- Slot order wins when an ability is ready now or inside the
+                -- short lookahead window.
+                if remaining <= PRIORITY_LOOKAHEAD then return spellName end
+                if remaining < soonestRemaining then
+                    soonest = spellName
+                    soonestRemaining = remaining
+                end
+            end
         end
     end
     if not readyOnly then return first end
+    if includeSoonest then return soonest end
     return nil
+end
+
+local function RotationContainsSpell(spellName)
+    local i
+    for i = 1, 5 do
+        if ShamanCore_Config["Rotation" .. i] == spellName then return true end
+    end
+    return false
+end
+
+local function GetRotationPreviewSpell()
+    local now = GetTime()
+    if lockedRotationPreview
+        and now < lockedRotationPreviewUntil
+        and RotationContainsSpell(lockedRotationPreview)
+        and GetRotationSpellRemaining(lockedRotationPreview) ~= nil then
+        return lockedRotationPreview
+    end
+
+    lockedRotationPreview = nil
+    lockedRotationPreviewUntil = 0
+    local spellName = GetNextRotationSpell(true, true)
+        or GetNextRotationSpell(false)
+    if spellName then
+        local remaining = GetRotationSpellRemaining(spellName) or 0
+        lockedRotationPreview = spellName
+        if remaining > 0 and remaining <= PRIORITY_LOOKAHEAD then
+            lockedRotationPreviewUntil =
+                now + math.max(0.35, remaining + 0.15)
+        else
+            -- Bridge the Vanilla GCD-to-real-cooldown reporting transition.
+            lockedRotationPreviewUntil = now + 0.75
+        end
+    end
+    return spellName
 end
 
 local function TryEmergencyHeal()
@@ -390,24 +483,6 @@ local function GetNextCombatBuff(readyOnly)
     return nil
 end
 
-local function GetNextRotateActionSpell()
-    if ShamanCore_Config.AutoHeal
-        and PlayerHealthPercent() <= (ShamanCore_Config.HealThreshold or 35) then
-        local healSpell = ShamanCore_Config.HealSpell
-        if healSpell and IsSpellReady(healSpell) then return healSpell end
-    end
-
-    local combatBuff = GetNextCombatBuff(true)
-    if combatBuff then return combatBuff end
-
-    if ShouldRunAutomaticBuffs() then
-        local buff = GetNextMissingBuff(true)
-        if buff then return buff end
-    end
-
-    return GetNextRotationSpell(true) or GetNextRotationSpell(false)
-end
-
 function ShamanCore_Buff()
     local spellName = GetNextMissingBuff(true)
     if spellName then CastSelf(spellName) end
@@ -429,10 +504,27 @@ function ShamanCore_Rotate()
 
     if not AcquireTarget() then return end
 
-    local spellName = GetNextRotationSpell(true)
+    local spellName = GetNextRotationSpell(true, false)
     if spellName then
         Debug("Casting " .. spellName)
+        local blockedUntil = GetTime() + 1.7
+        recentlyCastRotationSpells[spellName] = blockedUntil
+        -- All Shocks share a cooldown, but the Vanilla client initially
+        -- reports only their global cooldown. Block the family until the real
+        -- shared cooldown becomes visible through GetSpellCooldown.
+        if spellName == "Earth Shock" or spellName == "Flame Shock"
+            or spellName == "Frost Shock" then
+            blockedUntil = GetTime() + 6
+            recentlyCastRotationSpells["Earth Shock"] = blockedUntil
+            recentlyCastRotationSpells["Flame Shock"] = blockedUntil
+            recentlyCastRotationSpells["Frost Shock"] = blockedUntil
+        end
+        lastRotationAttempt = spellName
+        lockedRotationPreview = nil
+        lockedRotationPreviewUntil = 0
         CastSpellByName(spellName)
+        -- Force the next OnUpdate pass to repaint the macro immediately.
+        updateElapsed = 0.5
     end
 end
 
@@ -502,8 +594,6 @@ local function UpdateMacroIcon(name, spellName, fallback)
 end
 
 local function GetActionButtons()
-    -- Bartender2 exposes its additional bars through AllButtons. The default
-    -- UI and some other bar addons use AllActionButtons instead.
     if AllButtons then return AllButtons end
     if AllActionButtons then return AllActionButtons end
     local buttons = {}
@@ -522,30 +612,116 @@ local function GetActionButtons()
     return buttons
 end
 
-local function UpdateRotationCooldown(spellName)
-    local start, duration, enabled = 0, 0, 0
+local function GetSpellReadyState(spellName)
     local index = GetSpellIndex(spellName)
-    if index then
-        start, duration, enabled = GetSpellCooldown(index, BOOKTYPE_SPELL)
-        start = start or 0
-        duration = duration or 0
-        enabled = enabled or 0
+    if not index then return false, 0, 0, 0 end
+    local start, duration, enabled = GetSpellCooldown(index, BOOKTYPE_SPELL)
+    start = start or 0
+    duration = duration or 0
+    enabled = enabled or 0
+    local ready = enabled ~= 0
+        and (start == 0 or duration == 0
+            or start + duration <= GetTime())
+    return ready, start, duration, enabled
+end
+
+local function SuppressCooldownText(cooldown)
+    if not cooldown then return end
+    cooldown.noCooldownCount = true
+    cooldown.noOCC = true
+    cooldown.pfCooldownStyleText = 0
+    if cooldown.cooldowntext then cooldown.cooldowntext:Hide() end
+    if cooldown.pfCooldownText then cooldown.pfCooldownText:Hide() end
+end
+
+local function UpdateRotationReadyState(spellName)
+    local ready, start, duration, enabled = GetSpellReadyState(spellName)
+    local previewColor = ready and 1 or 0.42
+    local hasTimedSweep = not ready and start > 0 and duration > 0
+
+    if rotationMacroIcon then
+        rotationMacroIcon:SetVertexColor(
+            previewColor, previewColor, previewColor)
     end
 
     local _, button
     for _, button in ipairs(GetActionButtons()) do
         local actionSlot = ActionButton_GetPagedID(button)
         if actionSlot and GetActionText(actionSlot) == "Shaman Rot" then
-            local cooldown = getglobal(button:GetName() .. "Cooldown")
-            if cooldown then
-                CooldownFrame_SetTimer(cooldown, start, duration, enabled)
+            local icon = button.icon or button.iconTexture
+                or getglobal(button:GetName() .. "Icon")
+            -- Keep the action icon at full color. The native radial sweep
+            -- provides timed dimming; the shade below is only a fallback.
+            if icon then icon:SetVertexColor(1, 1, 1) end
+            SuppressCooldownText(
+                button.cd or getglobal(button:GetName() .. "Cooldown"))
+
+            -- Bartender can repaint macro vertex colors. A separate shade
+            -- keeps the unavailable state visible without a cooldown sweep.
+            if not button.ShamanCoreReadyShade and icon then
+                local shade = button:CreateTexture(nil, "OVERLAY")
+                shade:SetPoint("TOPLEFT", icon, "TOPLEFT", 0, 0)
+                shade:SetPoint("BOTTOMRIGHT", icon, "BOTTOMRIGHT", 0, 0)
+                shade:SetTexture(0, 0, 0)
+                shade:SetAlpha(0.55)
+                shade:Hide()
+                button.ShamanCoreReadyShade = shade
+            end
+
+            if not button.ShamanCoreCooldownSweep and icon then
+                local sweep = CreateFrame(
+                    "Model", nil, button, "CooldownFrameTemplate")
+                sweep:SetPoint("TOPLEFT", icon, "TOPLEFT", 0, 0)
+                sweep:SetPoint("BOTTOMRIGHT", icon, "BOTTOMRIGHT", 0, 0)
+                sweep:SetFrameLevel(button:GetFrameLevel() + 3)
+                -- Common cooldown-number addons honor one of these flags.
+                -- ShamanCore itself never creates numeric countdown text.
+                SuppressCooldownText(sweep)
+                button.ShamanCoreCooldownSweep = sweep
+            end
+
+            if button.ShamanCoreReadyShade then
+                if ready or hasTimedSweep then
+                    button.ShamanCoreReadyShade:Hide()
+                else
+                    button.ShamanCoreReadyShade:Show()
+                end
+            end
+            if button.ShamanCoreCooldownSweep then
+                local sweep = button.ShamanCoreCooldownSweep
+                SuppressCooldownText(sweep)
+                if not hasTimedSweep then
+                    if sweep.shamanCoreTimerActive then
+                        CooldownFrame_SetTimer(sweep, 0, 0, 0)
+                        sweep.shamanCoreTimerActive = nil
+                        sweep.shamanCoreStart = nil
+                        sweep.shamanCoreDuration = nil
+                        sweep.shamanCoreEnabled = nil
+                    end
+                else
+                    if not sweep.shamanCoreTimerActive
+                        or sweep.shamanCoreStart ~= start
+                        or sweep.shamanCoreDuration ~= duration
+                        or sweep.shamanCoreEnabled ~= enabled then
+                        CooldownFrame_SetTimer(
+                            sweep, start, duration, enabled)
+                        sweep.shamanCoreTimerActive = true
+                        sweep.shamanCoreStart = start
+                        sweep.shamanCoreDuration = duration
+                        sweep.shamanCoreEnabled = enabled
+                    end
+                end
+                SuppressCooldownText(sweep)
             end
         end
     end
 end
 
 local function UpdateIcons()
-    local rotation = GetNextRotateActionSpell()
+    -- Keep the Rotation macro focused on offensive priority. Buffs and
+    -- emergency healing may still be cast by ShamanCore_Rotate, but they do
+    -- not replace the displayed rotation ability.
+    local rotation = GetRotationPreviewSpell()
     local buff = GetNextMissingBuff(true)
     if rotationMacroIcon then
         rotationMacroIcon:SetTexture(ICON_PATH .. (rotation and GetSpellIcon(rotation) or WAIT_ICON))
@@ -555,7 +731,7 @@ local function UpdateIcons()
     end
     UpdateMacroIcon("Shaman Rot", rotation, WAIT_ICON)
     UpdateMacroIcon("Shaman Buff", buff, WAIT_ICON)
-    UpdateRotationCooldown(rotation)
+    UpdateRotationReadyState(rotation)
 end
 
 local function StyleButton(button)
@@ -742,7 +918,8 @@ local function MakeMacroButton(parent, x, y, labelText, macroName, body, iconKin
     button:RegisterForDrag("LeftButton")
     button:SetScript("OnDragStart", function()
         local spellName
-        if iconKind == "rotation" then spellName = GetNextRotateActionSpell()
+        if iconKind == "rotation" then
+            spellName = GetRotationPreviewSpell()
         elseif iconKind == "buff" then spellName = GetNextMissingBuff(false) end
         local macro = CreateCharacterMacro(macroName,
             spellName and GetSpellIcon(spellName) or DEFAULT_ICON, body)
@@ -1021,6 +1198,9 @@ eventFrame:RegisterEvent("VARIABLES_LOADED")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
 eventFrame:RegisterEvent("SPELLS_CHANGED")
 eventFrame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+eventFrame:RegisterEvent("SPELLCAST_FAILED")
+eventFrame:RegisterEvent("SPELLCAST_INTERRUPTED")
+eventFrame:RegisterEvent("SPELLCAST_STOP")
 eventFrame:SetScript("OnEvent", function()
     if event == "VARIABLES_LOADED" then
         CopyDefaults()
@@ -1036,6 +1216,23 @@ eventFrame:SetScript("OnEvent", function()
     elseif event == "SPELLS_CHANGED" or event == "LEARNED_SPELL_IN_TAB" then
         RefreshSpellBook()
         UpdateIcons()
+    elseif event == "SPELLCAST_FAILED" or event == "SPELLCAST_INTERRUPTED" then
+        if lastRotationAttempt then
+            recentlyCastRotationSpells[lastRotationAttempt] = nil
+            if lastRotationAttempt == "Earth Shock"
+                or lastRotationAttempt == "Flame Shock"
+                or lastRotationAttempt == "Frost Shock" then
+                recentlyCastRotationSpells["Earth Shock"] = nil
+                recentlyCastRotationSpells["Flame Shock"] = nil
+                recentlyCastRotationSpells["Frost Shock"] = nil
+            end
+            lastRotationAttempt = nil
+            updateElapsed = 0.5
+        end
+    elseif event == "SPELLCAST_STOP" then
+        -- Keep the short preview block, but no longer associate later,
+        -- unrelated spell failures with this successful rotation cast.
+        lastRotationAttempt = nil
     end
 end)
 

@@ -19,8 +19,19 @@ The Rotation button chooses one action per press:
    five rotation slots is used.
 
 Every Buff slot has an **Upkeep during combat** checkbox. Checked slots are
-maintained by Rotation during combat before attacking, and the Rotation macro
-shows the selected buff's icon when it is the next action.
+maintained by Rotation during combat before attacking. The Rotation macro
+continues to display only the next offensive ability. Its icon dims while that
+ability is unavailable and reveals clockwise with a radial cooldown sweep.
+ShamanCore does not add numeric countdown text.
+
+Configured Shock spells are skipped while their corresponding effect is
+already visible on the target.
+
+Rotation uses a 0.8-second priority lookahead. A higher-priority ability due
+inside that window is preferred over a lower-priority ready ability. When
+nothing is ready, the ability with the shortest remaining cooldown is shown.
+The chosen preview is held briefly while Vanilla transitions from global to
+real cooldown data, preventing rapid icon flicker.
 
 Each rotation dropdown is populated with learned offensive Shaman abilities.
 Passive spells, buffs, heals, weapon imbues, totems, and everything in the
